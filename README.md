@@ -18,23 +18,9 @@
 
 ## Quick usage
 
-1. Install the required Python 3 dependencies: `click`, `yaml` and `subprocess` (`sudo apt install python3-click python3-yaml python3-subprocess` in Debian) and optionally install `psycopg2` with `sudo apt install python3-psycopg2` for Postgresql support.
+For the recommended LinuxServer Jellyfin container setup, follow the [setup guide](docs/SETUP.md), which uses the LinuxServer rffmpeg Docker Mod.
 
-1. Create the directory `/etc/rffmpeg`.
-
-1. Optionally, copy the `rffmpeg.yml.sample` file to `/etc/rffmpeg/rffmpeg.yml` and edit it to suit your needs.
-
-1. Install `rffmpeg` somewhere useful, for instance at `/usr/local/bin/rffmpeg`.
-
-1. Create symlinks for the command names `ffmpeg` and `ffprobe` to `rffmpeg`, for example `sudo ln -s /usr/local/bin/rffmpeg /usr/local/bin/ffmpeg` and `sudo ln -s /usr/local/bin/rffmpeg /usr/local/bin/ffprobe`.
-
-1. Initialize the database and add a target host, for example `sudo rffmpeg init && rffmpeg add myhost.domain.tld`.
-
-1. Set your media program to use `rffmpeg` via the `ffmpeg` symlink name created above, instead of any other `ffmpeg` binary.
-
-1. Profit!
-
-`rffmpeg` does require a little bit more configuration to work properly however. For a comprehensive installation tutorial based on a reference setup, please see [the SETUP guide](docs/SETUP.md).
+For a native Debian/Ubuntu install, install `python3-click` and `python3-yaml`, copy the `rffmpeg` script into `/usr/local/bin`, and create `ffmpeg` and `ffprobe` symlinks to it. Configure the SSH user and key, initialize the database once on a new installation, add a worker, then point Jellyfin at the `ffmpeg` alias. See the [setup guide](docs/SETUP.md) for path sharing, SSH, and verification requirements. **Do not rerun `rffmpeg init` on an existing setup; it resets the database.**
 
 **NOTE** Jellyfin 10.10.x and newer require an additional `TMPDIR` environment variable set to somewhere exported to the remote machine, or these paths will not work properly. Edit your Jellyfin startup/service configuration to set that. See the setup guide for more details.
 
@@ -52,11 +38,15 @@ Each option has an explanatory comment above it detailing its purpose.
 
 The optional `routing` group controls whether FFmpeg jobs run locally or use the normal worker host selector. Jobs can be routed independently as `remux`, `audio_transcode`, `video_transcode`, `full_transcode`, or `unknown`. `full_transcode` means both audio and video are encoded; a video encode with copied audio is `video_transcode`. Routing is based on explicit output codec options, and ambiguous or auxiliary commands (such as subtitle extraction and image generation) use `unknown`. Routes default to `worker`; `worker_unavailable` defaults to `local` and can be set to `fail` to disable local fallback for routed FFmpeg jobs. `ffprobe` continues to use the normal worker-selection path, including its existing local fallback. If the routing group is omitted, all jobs continue to use workers as before.
 
+For remote execution, configure `remote.user` and any required SSH key arguments in the configuration file, or use the deployment's equivalent environment/configuration mechanism. The default SSH user is empty, so it must be set for a typical worker setup.
+
 Since the configuration file is YAML, ensure that you do not use "Tab" characters inside of it, only spaces.
 
 ### CLI interface to `rffmpeg`
 
 `rffmpeg` is a [Click](https://click.palletsprojects.com)-based application; thus, all commands have a `-h` or `--help` flag to show usage and additional options that may be specified.
+
+Use `rffmpeg check` to run non-destructive setup checks. Repeat `--shared-read PATH` or `--shared-write PATH` to check that a shared directory is accessible locally and on each configured worker.
 
 ### Initializing `rffmpeg`
 

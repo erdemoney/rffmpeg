@@ -27,6 +27,7 @@ import re
 import signal
 import sys
 import shlex
+import shutil
 import yaml
 
 from contextlib import contextmanager
@@ -429,6 +430,150 @@ def run_command(command, stdin, stdout, stderr):
     return p
 
 
+def run_check_command(config, target_hostname, command_args):
+    """Run a read-only diagnostic command locally or on one worker."""
+    if target_hostname in ["localhost", "127.0.0.1"]:
+        command = command_args
+    else:
+        ssh_command = generate_ssh_command(config, target_hostname)
+        if "-q" in ssh_command:
+            ssh_command.remove("-q")
+        remote_command = " ".join(map(shlex.quote, command_args))
+        command = ssh_command + [remote_command]
+
+    try:
+        result = run_command(command, PIPE, PIPE, PIPE)
+    except OSError as error:
+        return False, str(error)
+
+    output = (result.stdout or result.stderr or "").strip()
+    if result.returncode == 0:
+        detail = output.splitlines()[0] if output else ""
+        return True, detail
+
+    detail = output.splitlines()[0] if output else f"exit code {result.returncode}"
+    return False, detail
+
+
+def check_directory_access(path, writable=False):
+    """Check that a directory is available to the current user."""
+    path = os.path.abspath(path)
+    directory = Path(path)
+    if not directory.is_dir():
+        return False, f"directory not found: {path}"
+
+    required_access = os.X_OK | (os.W_OK if writable else os.R_OK)
+    if not os.access(path, required_access):
+        access_type = "write" if writable else "read"
+        return False, f"directory is not {access_type}-accessible: {path}"
+
+    return True, path
+
+
+def check_worker_directory(config, target_hostname, path, writable=False):
+    """Check a shared directory is mounted and accessible on a worker."""
+    path = os.path.abspath(path)
+    if target_hostname in ["localhost", "127.0.0.1"]:
+        return check_directory_access(path, writable)
+
+    access_flag = "-w" if writable else "-r"
+    quoted_path = shlex.quote(path)
+    test_command = f"test -d {quoted_path} && test {access_flag} {quoted_path} && test -x {quoted_path}"
+    return run_check_command(config, target_hostname, ["sh", "-c", test_command])
+
+
+def preflight_checks(config, shared_read_paths=(), shared_write_paths=()):
+    """Collect non-destructive checks for the local wrapper and configured workers."""
+    results = []
+
+    def record(success, description, detail=""):
+        results.append(
+            {
+                "success": success,
+                "description": description,
+                "detail": detail,
+            }
+        )
+
+    wrapper_path = str(Path(__file__).resolve())
+    for alias in ["ffmpeg", "ffprobe"]:
+        alias_path = shutil.which(alias)
+        if alias_path is None:
+            record(False, f"{alias} alias", "not found in PATH")
+            continue
+        try:
+            points_to_wrapper = os.path.samefile(alias_path, wrapper_path)
+        except OSError:
+            points_to_wrapper = False
+        record(
+            points_to_wrapper,
+            f"{alias} alias",
+            alias_path if points_to_wrapper else f"{alias_path} does not point to rffmpeg",
+        )
+
+    if DB_TYPE == "SQLITE" and not Path(config["db_path"]).is_file():
+        record(
+            False,
+            "rffmpeg database",
+            f"not found at {config['db_path']}; initialize a new installation before checking workers",
+        )
+        return results
+
+    try:
+        with dbconn(config) as cur:
+            cur.execute("SELECT id, servername, hostname FROM hosts")
+            hosts = cur.fetchall()
+    except Exception as error:
+        record(False, "rffmpeg database", str(error))
+        return results
+
+    if not hosts:
+        record(False, "configured workers", "no workers are configured; add one with 'rffmpeg add HOST'")
+        return results
+
+    record(True, "rffmpeg database", f"found {len(hosts)} configured worker(s)")
+
+    for host_id, servername, hostname in hosts:
+        if hostname in ["localhost", "127.0.0.1"]:
+            executables = [
+                ("ffmpeg", config["fallback_ffmpeg_command"]),
+                ("ffprobe", config["fallback_ffprobe_command"]),
+            ]
+        else:
+            executables = [
+                ("ffmpeg", config["ffmpeg_command"]),
+                ("ffprobe", config["ffprobe_command"]),
+            ]
+
+        for executable_name, executable in executables:
+            success, detail = run_check_command(
+                config, hostname, [executable, "-version"]
+            )
+            record(success, f"{servername} {executable_name}", detail)
+
+        for path in shared_read_paths:
+            success, detail = check_worker_directory(
+                config, hostname, path, writable=False
+            )
+            record(success, f"{servername} read access: {path}", detail)
+
+        for path in shared_write_paths:
+            success, detail = check_worker_directory(
+                config, hostname, path, writable=True
+            )
+            record(success, f"{servername} write access: {path}", detail)
+
+    for path in shared_read_paths:
+        success, detail = check_directory_access(path, writable=False)
+        record(success, f"local read access: {path}", detail)
+
+    for path in shared_write_paths:
+        success, detail = check_directory_access(path, writable=True)
+        record(success, f"local write access: {path}", detail)
+
+    return results
+
+
 def get_target_host(config):
     """
     Determine an optimal target host via data on currently active processes and states.
@@ -732,10 +877,14 @@ def run_control(config):
     CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=120)
 
     @click.group(context_settings=CONTEXT_SETTINGS)
-    def rffmpeg_click():
+    @click.pass_context
+    def rffmpeg_click(ctx):
         """
         rffmpeg CLI interface
         """
+        if ctx.invoked_subcommand == "check":
+            return
+
         if (
             not Path(config["state_dir"]).is_dir()
             or not Path(config["db_path"]).is_file()
@@ -983,6 +1132,41 @@ def run_control(config):
         click.echo("\n".join(output))
 
     rffmpeg_click.add_command(rffmpeg_click_status)
+
+    @click.command(name="check", short_help="Check the rffmpeg setup.")
+    @click.option(
+        "--shared-read",
+        "shared_read_paths",
+        multiple=True,
+        metavar="PATH",
+        help="Check that PATH is readable locally and on every configured worker.",
+    )
+    @click.option(
+        "--shared-write",
+        "shared_write_paths",
+        multiple=True,
+        metavar="PATH",
+        help="Check that PATH is writable locally and on every configured worker.",
+    )
+    def rffmpeg_click_check(shared_read_paths, shared_write_paths):
+        """Check aliases, database, workers, and optionally shared directories."""
+        results = preflight_checks(config, shared_read_paths, shared_write_paths)
+        failures = 0
+        for result in results:
+            if result["success"]:
+                status = "PASS"
+            else:
+                status = "FAIL"
+                failures += 1
+
+            detail = f" - {result['detail']}" if result["detail"] else ""
+            click.echo(f"[{status}] {result['description']}{detail}")
+
+        click.echo(f"Preflight complete: {len(results) - failures} passed, {failures} failed.")
+        if failures:
+            exit(1)
+
+    rffmpeg_click.add_command(rffmpeg_click_check)
 
     @click.command(name="add", short_help="Add a host.")
     @click.option(

@@ -2,7 +2,9 @@ import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
+import sqlite3
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -213,6 +215,67 @@ class ClassifyFfmpegJobTests(unittest.TestCase):
 
         self.assertEqual(result.exception.code, 1)
         run_local_ffmpeg.assert_not_called()
+
+
+class PreflightCheckTests(unittest.TestCase):
+    def test_local_directory_access_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            success, detail = rffmpeg.check_directory_access(directory, writable=True)
+
+        self.assertTrue(success)
+        self.assertTrue(detail.endswith(directory))
+
+    def test_remote_check_quotes_arguments_for_ssh(self):
+        config = {
+            "ssh_command": "/usr/bin/ssh",
+            "persist_time": 0,
+            "remote_args": [],
+            "remote_user": "jellyfin",
+        }
+        result = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(rffmpeg, "run_command", return_value=result) as run_command:
+            success, detail = rffmpeg.run_check_command(
+                config, "worker", ["test", "-r", "/data/media library"]
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(detail, "")
+        remote_command = run_command.call_args.args[0][-1]
+        self.assertEqual(remote_command, "test -r '/data/media library'")
+
+    def test_preflight_checks_aliases_and_registered_worker_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "rffmpeg.db"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "CREATE TABLE hosts (id INTEGER, servername TEXT, hostname TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO hosts VALUES (1, 'worker1', 'worker1.example')"
+                )
+
+            config = {
+                "db_path": str(database_path),
+                "ffmpeg_command": "/usr/bin/ffmpeg",
+                "ffprobe_command": "/usr/bin/ffprobe",
+                "fallback_ffmpeg_command": "/usr/bin/ffmpeg",
+                "fallback_ffprobe_command": "/usr/bin/ffprobe",
+                "ssh_command": "/usr/bin/ssh",
+                "persist_time": 0,
+                "remote_args": [],
+                "remote_user": "jellyfin",
+            }
+            command_result = (True, "ffmpeg version test")
+            with patch.object(
+                rffmpeg.shutil, "which", return_value=str(Path(rffmpeg.__file__).resolve())
+            ), patch.object(
+                rffmpeg, "run_check_command", return_value=command_result
+            ) as run_check_command:
+                results = rffmpeg.preflight_checks(config)
+
+        self.assertTrue(all(result["success"] for result in results))
+        self.assertEqual(run_check_command.call_count, 2)
 
 
 if __name__ == "__main__":
