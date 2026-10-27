@@ -59,6 +59,22 @@ rffmpeg:
         #    - "-i"
         #    - "/var/lib/jellyfin/id_rsa"
 
+    # FFmpeg job routing configuration
+    routing:
+        # Route used for jobs that cannot be confidently classified.
+        #default: worker
+
+        # Route each classified job to "worker" (use the normal host selector)
+        # or "local" (run on this machine without selecting a worker).
+        #remux: worker
+        #audio_transcode: worker
+        #video_transcode: worker
+        #full_transcode: worker
+        #unknown: worker
+
+        # If a worker route has no available worker, run locally or fail the job.
+        #worker_unavailable: local
+
     # Remote command configuration
     commands:
         # The path (either full or in $PATH) to the default SSH binary.

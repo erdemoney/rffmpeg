@@ -44,11 +44,13 @@
 
 `rffmpeg` will look at `/etc/rffmpeg/rffmpeg.yml` (or a path specified by the `RFFMPEG_CONFIG` environment variable) for a configuration file. If it doesn't find one, defaults will be used instead. You can use this file to override many configurable default values to better fit your environment. The defaults should be sensible for anyone using [Jellyfin](https://jellyfin.org) and following the [SETUP guide](SETUP.md).
 
-The example configuration file at `rffmpeg.yml.sample` shows all available options; this file can be copied as-is to the above location and edited to suit your needs; simply uncomment any lines you want to change. Note that if you do specify a file, you *must* ensure that all top-level categories are present or it will error out.
+The example configuration file at `rffmpeg.yml.sample` shows all available options; this file can be copied as-is to the above location and edited to suit your needs; simply uncomment any lines you want to change. A configuration file must contain the top-level `rffmpeg` key; individual groups, including the optional `routing` group, can be omitted and will use their defaults.
 
 **NOTE:** If you are running into problems with `rffmpeg`, you must use the config file to adjust `logging` -> `debug` to `true` to obtain more detailed logs before requesting help.
 
 Each option has an explanatory comment above it detailing its purpose.
+
+The optional `routing` group controls whether FFmpeg jobs run locally or use the normal worker host selector. Jobs can be routed independently as `remux`, `audio_transcode`, `video_transcode`, `full_transcode`, or `unknown`. `full_transcode` means both audio and video are encoded; a video encode with copied audio is `video_transcode`. Routing is based on explicit output codec options, and ambiguous or auxiliary commands (such as subtitle extraction and image generation) use `unknown`. Routes default to `worker`; `worker_unavailable` defaults to `local` and can be set to `fail` to disable local fallback for routed FFmpeg jobs. `ffprobe` continues to use the normal worker-selection path, including its existing local fallback. If the routing group is omitted, all jobs continue to use workers as before.
 
 Since the configuration file is YAML, ensure that you do not use "Tab" characters inside of it, only spaces.
 
@@ -146,17 +148,17 @@ This depends on what "layer" you're asking at.
 * OUTDATED Cloud: [HCloud Rffmpeg](https://github.com/aleksasiriski/hcloud-rffmpeg) script made to read rffmpeg database and spin up more transcode nodes in Hetzner Cloud.
 * Kubernetes: A short guide and example yaml files are available [here](https://github.com/aleksasiriski/rffmpeg-worker/tree/main/Kubernetes).
 
-### Can `rffmpeg` mangle/alter FFMPEG arguments?
+### Can `rffmpeg` inspect or alter FFMPEG arguments?
 
-Explicitly *no*. `rffmpeg` is not designed to interact with the arguments that the media server passes to `ffmpeg`/`ffprobe` at all, nor will it.
+`rffmpeg` never rewrites or alters the arguments passed to FFmpeg. It reads output codec options to classify common jobs as remux, audio transcode, video transcode, or full audio/video transcode. It does not attempt to fully parse FFmpeg's command language; commands it cannot confidently classify use the `unknown` route.
 
-This is an explicit design decision due to the massive complexity of FFmpeg. FFmpeg has a very large number of possible arguments, many of which are position-dependent or dependent on other arguments elsewhere in the chain. To implement argument mangling, we would need to be aware of every possible FFmpeg argument, exactly how each argument maps to each other argument, and be able to dynamically parse and update arguments based on this. As should hopefully be quite obvious, this is a massive undertaking and not something that I have any desire to implement or manage in such a (relatively) simple utility.
+This distinction matters because FFmpeg has many possible arguments, some position-dependent or dependent on other arguments. Classification is intentionally limited to explicit output codec options; the complete argument list is passed through unchanged.
 
-This has a number of effects:
+This means:
 
  * `rffmpeg` cannot adjust any `ffmpeg` options based on the host selected.
- * `rffmpeg` does not know whether hardware acceleration is turned on or not (see above caveats under [Hardware Acceleration](#hardware-acceleration)), or what type(s) of hardware acceleration are active.
- * `rffmpeg` does not know what media file(s) is is handling or where it's outputting files to, and cannot alter these paths.
+ * `rffmpeg` does not manage hardware acceleration or ensure the selected host supports it; see the caveats under [Hardware Acceleration](#hardware-acceleration).
+ * `rffmpeg` does not know what media file(s) it is handling or where it is outputting files, and cannot alter these paths.
 
 Thus it is imperative that you set up your entire system correctly for `rffmpeg` to work using a "least-common-denominator" approach as required. Please see the [SETUP guide](SETUP.md) for more information.
 

@@ -23,6 +23,7 @@
 import click
 import logging
 import os
+import re
 import signal
 import sys
 import shlex
@@ -32,7 +33,6 @@ from contextlib import contextmanager
 from grp import getgrnam
 from pathlib import Path
 from pwd import getpwnam
-from re import search
 from sqlite3 import connect as sqlite_connect
 from subprocess import run, PIPE
 from time import sleep
@@ -127,7 +127,13 @@ def load_config():
     if not Path(config_file).is_file():
         log.info(f"No config found in {config_file}. Using default settings.")
         o_config = {
-            "rffmpeg": {"logging": {}, "directories": {}, "remote": {}, "commands": {}}
+            "rffmpeg": {
+                "logging": {},
+                "directories": {},
+                "remote": {},
+                "commands": {},
+                "routing": {},
+            }
         }
     else:
         with open(config_file, "r") as cfgfh:
@@ -162,6 +168,39 @@ def load_config():
     config_commands = config_base.get("commands", dict())
     if config_commands is None:
         config_commands = dict()
+
+    # Parse routing policy. Missing per-type entries inherit the default route.
+    config_routing = config_base.get("routing", dict())
+    if config_routing is None:
+        config_routing = dict()
+    if not isinstance(config_routing, dict):
+        fail("Configuration key 'rffmpeg.routing' must be a mapping.")
+
+    default_route = str(config_routing.get("default", "worker")).lower()
+    if default_route not in ["worker", "local"]:
+        fail("Configuration key 'rffmpeg.routing.default' must be 'worker' or 'local'.")
+
+    config["routing"] = {"default": default_route}
+    for job_type in [
+        "remux",
+        "audio_transcode",
+        "video_transcode",
+        "full_transcode",
+        "unknown",
+    ]:
+        route = str(config_routing.get(job_type, default_route)).lower()
+        if route not in ["worker", "local"]:
+            fail(
+                f"Configuration key 'rffmpeg.routing.{job_type}' must be 'worker' or 'local'."
+            )
+        config["routing"][job_type] = route
+
+    worker_unavailable = str(config_routing.get("worker_unavailable", "local")).lower()
+    if worker_unavailable not in ["local", "fail"]:
+        fail(
+            "Configuration key 'rffmpeg.routing.worker_unavailable' must be 'local' or 'fail'."
+        )
+    config["routing"]["worker_unavailable"] = worker_unavailable
 
     # Parse the keys from the logging group
     config["log_to_file"] = config_logging.get("log_to_file", True)
@@ -230,6 +269,93 @@ def load_config():
     config["current_pid"] = os.getpid()
 
     return config
+
+
+def classify_ffmpeg_job(ffmpeg_args):
+    """
+    Classify a Jellyfin FFmpeg command using explicit output codec options.
+
+    Jellyfin emits codec options for output streams. Commands that don't provide
+    enough information (including subtitle extraction and image generation) are
+    deliberately classified as unknown rather than guessed.
+    """
+    if any(
+        arg == "-vframes" or arg.startswith("-frames:v") for arg in ffmpeg_args
+    ):
+        return "unknown"
+
+    # Image extraction and trickplay jobs encode image sequences rather than
+    # normal playback outputs and should follow the unknown policy.
+    for index, arg in enumerate(ffmpeg_args[:-1]):
+        if arg == "-f" and ffmpeg_args[index + 1].lower() in [
+            "image2",
+            "image2pipe",
+        ]:
+            return "unknown"
+
+    input_positions = [index for index, arg in enumerate(ffmpeg_args) if arg == "-i"]
+    if not input_positions:
+        return "unknown"
+
+    # Jellyfin adds output codec options after its input arguments. Restricting
+    # the scan to after the final input avoids mistaking decoder options for
+    # output encoders.
+    codec_args = ffmpeg_args[input_positions[-1] + 2 :]
+    codecs = {"v": [], "a": []}
+    aliases = {"-vcodec": "v", "-acodec": "a"}
+    codec_option = re.compile(r"^-(?:c|codec):([va])(?:$|:)")
+
+    index = 0
+    while index < len(codec_args):
+        token = codec_args[index]
+        option, has_inline_value, inline_value = token.partition("=")
+
+        stream_type = aliases.get(option.lower())
+        if stream_type is None:
+            match = codec_option.match(option.lower())
+            if match:
+                stream_type = match.group(1)
+            elif option.lower() in ["-c", "-codec"]:
+                # An unqualified codec can affect several output stream types.
+                return "unknown"
+
+        if stream_type is not None:
+            if has_inline_value:
+                codec = inline_value
+            elif index + 1 < len(codec_args):
+                index += 1
+                codec = codec_args[index]
+            else:
+                return "unknown"
+
+            if not codec or codec.startswith("-"):
+                return "unknown"
+            codecs[stream_type].append(codec.lower())
+
+        index += 1
+
+    if not codecs["v"] and not codecs["a"]:
+        return "unknown"
+
+    # Any encoded stream makes that media type an encode. This intentionally
+    # routes mixed-copy/encode commands conservatively toward the more expensive
+    # classification.
+    video_encoded = any(codec != "copy" for codec in codecs["v"])
+    audio_encoded = any(codec != "copy" for codec in codecs["a"])
+
+    if video_encoded and audio_encoded:
+        return "full_transcode"
+    if video_encoded:
+        return "video_transcode"
+    if audio_encoded:
+        return "audio_transcode"
+    return "remux"
+
+
+def get_ffmpeg_route(config, ffmpeg_args):
+    """Return the detected FFmpeg job type and its configured route."""
+    job_type = classify_ffmpeg_job(ffmpeg_args)
+    return job_type, config["routing"][job_type]
 
 
 def cleanup(signum="", frame=""):
@@ -555,24 +681,47 @@ def run_ffmpeg(config, ffmpeg_args):
 
     log.info(f"Starting rffmpeg as {cmd_name} with args: {' '.join(ffmpeg_args)}")
 
-    target_hid, target_hostname, target_servername = get_target_host(config)
+    is_ffprobe = "ffprobe" in cmd_name
+    if is_ffprobe:
+        # Keep ffprobe on its existing worker-selection path.
+        job_type = "ffprobe"
+        route = "worker"
+    else:
+        job_type, route = get_ffmpeg_route(config, ffmpeg_args)
+    log.info(f"Classified command as '{job_type}'; routing to '{route}'")
 
+    ret = None
+    returncode = 200
     try:
-        returncode = 200
-        if not target_hostname or target_hostname == "localhost":
+        if route == "local":
             ret = run_local_ffmpeg(config, None, ffmpeg_args)
-            returncode = ret.returncode
         else:
-            ret = run_remote_ffmpeg(
-                config, target_hid, target_hostname, target_servername, ffmpeg_args
-            )
+            target_hid, target_hostname, target_servername = get_target_host(config)
+
+            if (
+                not is_ffprobe
+                and not target_hostname
+                and config["routing"]["worker_unavailable"] == "fail"
+            ):
+                log.error(
+                    f"No worker is available for '{job_type}' and local fallback is disabled."
+                )
+                returncode = 1
+            elif not target_hostname or target_hostname == "localhost":
+                ret = run_local_ffmpeg(config, None, ffmpeg_args)
+            else:
+                ret = run_remote_ffmpeg(
+                    config, target_hid, target_hostname, target_servername, ffmpeg_args
+                )
+
+        if ret is not None:
             returncode = ret.returncode
     finally:
         cleanup()
-        if returncode == 0:
-            log.info(f"Finished rffmpeg with return code {ret.returncode}")
+        if ret is not None and returncode == 0:
+            log.info(f"Finished rffmpeg with return code {returncode}")
         else:
-            log.error(f"Finished rffmpeg with return code {ret.returncode}")
+            log.error(f"Finished rffmpeg with return code {returncode}")
         exit(returncode)
 
 
